@@ -19,6 +19,7 @@ export class DatabaseManager {
   private currentDbPath: string = './ems_demo.db';
   private currentDbType: DBType = 'sqlite';
   private connectionDetails: any = null;
+  private corruptRetries = new Map<string, number>();
 
   // Active external database connections
   private pgClient: pg.Client | null = null;
@@ -173,16 +174,37 @@ export class DatabaseManager {
   }
 
   private handleCorruptDbFile(dbPath: string, onCorrupt: () => void) {
+    const attempts = this.corruptRetries.get(dbPath) || 0;
+    if (attempts >= 3) {
+      console.error(`[Self-Healing] Database ${dbPath} is persistently corrupt and cannot be automatically recreated (possibly locked by another process). To prevent infinite loop, self-healing has paused. Please check for file locks and restart the application.`);
+      return;
+    }
+    this.corruptRetries.set(dbPath, attempts + 1);
+
+    // Reset retry count after 10 seconds of stability
+    setTimeout(() => {
+      this.corruptRetries.delete(dbPath);
+    }, 10000);
+
+    let deleteSuccess = false;
     try {
       if (fs.existsSync(dbPath)) {
         fs.unlinkSync(dbPath);
         console.warn(`[Self-Healing] Successfully deleted corrupt SQLite database file: ${dbPath}`);
+        deleteSuccess = true;
+      } else {
+        deleteSuccess = true; // File doesn't exist, we're good
       }
     } catch (e) {
       console.error(`[Self-Healing] Failed to delete corrupt database file ${dbPath}:`, e);
     }
-    // Re-initialize the database connection
-    onCorrupt();
+
+    if (deleteSuccess) {
+      // Re-initialize only if we successfully got rid of the corrupt file
+      onCorrupt();
+    } else {
+      console.error(`[Self-Healing] Pausing retry for ${dbPath} because deletion failed. File is busy or locked.`);
+    }
   }
 
   // Initialize Audit Log DB
@@ -1572,142 +1594,164 @@ export class DatabaseManager {
 
   private async getMssqlSchema(): Promise<SchemaMetadata> {
     const schema: SchemaMetadata = { tables: [], views: [], procedures: [] };
-    if (!this.mssqlPool) return schema;
 
     try {
       // 1. Get Tables
-      const tablesRes = await this.mssqlPool.request().query(`
+      const tablesRes = await this.executeQuery(`
         SELECT SCHEMA_NAME(schema_id) AS table_schema, name 
         FROM sys.tables
       `);
 
-      for (const tRow of tablesRes.recordset) {
-        const tSchema = tRow.table_schema;
-        const tName = tRow.name;
-        const fullTableName = `[${tSchema}].[${tName}]`;
+      if (tablesRes.success && tablesRes.data) {
+        for (const tRow of tablesRes.data) {
+          const tSchema = tRow.table_schema || tRow.TABLE_SCHEMA || 'dbo';
+          const tName = tRow.name || tRow.TABLE_NAME;
+          const fullTableName = `[${tSchema}].[${tName}]`;
 
-        try {
-          // Get columns
-          const colsRes = await this.mssqlPool.request().input('tblName', fullTableName).query(`
-            SELECT 
-              c.name AS column_name, 
-              TYPE_NAME(c.user_type_id) AS data_type, 
-              c.is_nullable
-            FROM sys.columns c
-            WHERE c.object_id = OBJECT_ID(@tblName)
-            ORDER BY c.column_id
-          `);
-
-          let pkCols: string[] = [];
           try {
-            const pkRes = await this.mssqlPool.request().input('tblName', fullTableName).query(`
-              SELECT c.name AS column_name
-              FROM sys.index_columns ic
-              JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-              JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-              WHERE i.is_primary_key = 1 AND ic.object_id = OBJECT_ID(@tblName)
-            `);
-            pkCols = pkRes.recordset.map((r: any) => r.column_name);
-          } catch (pkErr) {
-            console.warn(`Failed to fetch PKs for ${fullTableName}:`, pkErr);
-          }
-
-          let fkRows: any[] = [];
-          try {
-            const fkRes = await this.mssqlPool.request().input('tblName', fullTableName).query(`
+            // Get columns
+            const colsRes = await this.executeQuery(`
               SELECT 
-                col.name AS column_name,
-                parent_table.name AS foreign_table,
-                ref_col.name AS foreign_column
-              FROM sys.foreign_key_columns fkc
-              JOIN sys.columns col ON fkc.parent_object_id = col.object_id AND fkc.parent_column_id = col.column_id
-              JOIN sys.tables parent_table ON fkc.referenced_object_id = parent_table.object_id
-              JOIN sys.columns ref_col ON fkc.referenced_object_id = ref_col.object_id AND fkc.referenced_column_id = ref_col.column_id
-              WHERE fkc.parent_object_id = OBJECT_ID(@tblName)
+                c.name AS column_name, 
+                TYPE_NAME(c.user_type_id) AS data_type, 
+                c.is_nullable
+              FROM sys.columns c
+              WHERE c.object_id = OBJECT_ID('${fullTableName.replace(/'/g, "''")}')
+              ORDER BY c.column_id
             `);
-            fkRows = fkRes.recordset;
-          } catch (fkErr) {
-            console.warn(`Failed to fetch FKs for ${fullTableName}:`, fkErr);
-          }
 
-          const columns = colsRes.recordset.map((c: any) => {
-            const fk = fkRows.find((f: any) => f.column_name === c.column_name);
-            return {
-              name: c.column_name,
-              type: c.data_type,
-              nullable: c.is_nullable,
-              isPrimary: pkCols.includes(c.column_name),
-              isForeign: !!fk,
-              foreignTable: fk ? fk.foreign_table : undefined,
-              foreignColumn: fk ? fk.foreign_column : undefined
-            };
-          });
-
-          // Row count with partition stats fallback
-          let rowCount = 0;
-          try {
-            const countRes = await this.mssqlPool.request().input('tblName', fullTableName).query(`
-              SELECT SUM(row_count) AS count 
-              FROM sys.dm_db_partition_stats 
-              WHERE object_id = OBJECT_ID(@tblName) AND index_id < 2
-            `);
-            rowCount = countRes.recordset && countRes.recordset[0] ? (countRes.recordset[0].count || 0) : 0;
-          } catch (cntErr) {
+            let pkCols: string[] = [];
             try {
-              const countRes2 = await this.mssqlPool.request().query(`SELECT COUNT(*) AS count FROM ${fullTableName}`);
-              rowCount = countRes2.recordset && countRes2.recordset[0] ? (countRes2.recordset[0].count || 0) : 0;
-            } catch (_) {}
-          }
+              const pkRes = await this.executeQuery(`
+                SELECT c.name AS column_name
+                FROM sys.index_columns ic
+                JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                WHERE i.is_primary_key = 1 AND ic.object_id = OBJECT_ID('${fullTableName.replace(/'/g, "''")}')
+              `);
+              if (pkRes.success && pkRes.data) {
+                pkCols = pkRes.data.map((r: any) => r.column_name || r.COLUMN_NAME);
+              }
+            } catch (pkErr) {
+              console.warn(`Failed to fetch PKs for ${fullTableName}:`, pkErr);
+            }
 
-          schema.tables.push({
-            name: tName,
-            schema: tSchema,
-            columns,
-            rowCount
-          });
-        } catch (tblErr: any) {
-          console.error(`Failed to load metadata for table ${fullTableName}:`, tblErr);
-          schema.tables.push({
-            name: tName,
-            schema: tSchema,
-            columns: [],
-            rowCount: 0
-          });
+            let fkRows: any[] = [];
+            try {
+              const fkRes = await this.executeQuery(`
+                SELECT 
+                  col.name AS column_name,
+                  parent_table.name AS foreign_table,
+                  ref_col.name AS foreign_column
+                FROM sys.foreign_key_columns fkc
+                JOIN sys.columns col ON fkc.parent_object_id = col.object_id AND fkc.parent_column_id = col.column_id
+                JOIN sys.tables parent_table ON fkc.referenced_object_id = parent_table.object_id
+                JOIN sys.columns ref_col ON fkc.referenced_object_id = ref_col.object_id AND fkc.referenced_column_id = ref_col.column_id
+                WHERE fkc.parent_object_id = OBJECT_ID('${fullTableName.replace(/'/g, "''")}')
+              `);
+              if (fkRes.success && fkRes.data) {
+                fkRows = fkRes.data;
+              }
+            } catch (fkErr) {
+              console.warn(`Failed to fetch FKs for ${fullTableName}:`, fkErr);
+            }
+
+            let columns: any[] = [];
+            if (colsRes.success && colsRes.data) {
+              columns = colsRes.data.map((c: any) => {
+                const cName = c.column_name || c.COLUMN_NAME;
+                const cType = c.data_type || c.DATA_TYPE;
+                const cNullable = c.is_nullable !== undefined ? c.is_nullable : c.IS_NULLABLE;
+                const fk = fkRows.find((f: any) => (f.column_name || f.COLUMN_NAME) === cName);
+                return {
+                  name: cName,
+                  type: cType,
+                  nullable: !!cNullable,
+                  isPrimary: pkCols.includes(cName),
+                  isForeign: !!fk,
+                  foreignTable: fk ? (fk.foreign_table || fk.FOREIGN_TABLE) : undefined,
+                  foreignColumn: fk ? (fk.foreign_column || fk.FOREIGN_COLUMN) : undefined
+                };
+              });
+            }
+
+            // Row count with partition stats fallback
+            let rowCount = 0;
+            try {
+              const countRes = await this.executeQuery(`
+                SELECT SUM(row_count) AS count 
+                FROM sys.dm_db_partition_stats 
+                WHERE object_id = OBJECT_ID('${fullTableName.replace(/'/g, "''")}') AND index_id < 2
+              `);
+              if (countRes.success && countRes.data && countRes.data[0]) {
+                rowCount = countRes.data[0].count ?? countRes.data[0].COUNT ?? 0;
+              } else {
+                const countRes2 = await this.executeQuery(`SELECT COUNT(*) AS count FROM ${fullTableName}`);
+                if (countRes2.success && countRes2.data && countRes2.data[0]) {
+                  rowCount = countRes2.data[0].count ?? countRes2.data[0].COUNT ?? 0;
+                }
+              }
+            } catch (cntErr) {
+              try {
+                const countRes2 = await this.executeQuery(`SELECT COUNT(*) AS count FROM ${fullTableName}`);
+                if (countRes2.success && countRes2.data && countRes2.data[0]) {
+                  rowCount = countRes2.data[0].count ?? countRes2.data[0].COUNT ?? 0;
+                }
+              } catch (_) {}
+            }
+
+            schema.tables.push({
+              name: tName,
+              schema: tSchema,
+              columns,
+              rowCount
+            });
+          } catch (tblErr: any) {
+            console.error(`Failed to load metadata for table ${fullTableName}:`, tblErr);
+            schema.tables.push({
+              name: tName,
+              schema: tSchema,
+              columns: [],
+              rowCount: 0
+            });
+          }
         }
       }
 
       // 2. Get Views
       try {
-        const viewsRes = await this.mssqlPool.request().query(`
+        const viewsRes = await this.executeQuery(`
           SELECT SCHEMA_NAME(schema_id) AS view_schema, name, OBJECT_DEFINITION(object_id) AS definition 
           FROM sys.views
         `);
-        for (const vRow of viewsRes.recordset) {
-          const vSchema = vRow.view_schema;
-          const vName = vRow.name;
-          const vDef = vRow.definition || '';
-          const fullViewName = `[${vSchema}].[${vName}]`;
+        if (viewsRes.success && viewsRes.data) {
+          for (const vRow of viewsRes.data) {
+            const vSchema = vRow.view_schema || vRow.VIEW_SCHEMA || 'dbo';
+            const vName = vRow.name || vRow.VIEW_NAME;
+            const vDef = vRow.definition || vRow.DEFINITION || '';
+            const fullViewName = `[${vSchema}].[${vName}]`;
 
-          try {
-            const vColsRes = await this.mssqlPool.request().input('viewName', fullViewName).query(`
-              SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(@viewName) ORDER BY column_id
-            `);
+            try {
+              const vColsRes = await this.executeQuery(`
+                SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('${fullViewName.replace(/'/g, "''")}') ORDER BY column_id
+              `);
 
-            schema.views.push({
-              name: vName,
-              schema: vSchema,
-              definition: vDef,
-              columns: vColsRes.recordset.map((r: any) => r.name),
-              sourceObjects: []
-            });
-          } catch (vColErr) {
-            schema.views.push({
-              name: vName,
-              schema: vSchema,
-              definition: vDef,
-              columns: [],
-              sourceObjects: []
-            });
+              schema.views.push({
+                name: vName,
+                schema: vSchema,
+                definition: vDef,
+                columns: vColsRes.success && vColsRes.data ? vColsRes.data.map((r: any) => r.name || r.NAME) : [],
+                sourceObjects: []
+              });
+            } catch (vColErr) {
+              schema.views.push({
+                name: vName,
+                schema: vSchema,
+                definition: vDef,
+                columns: [],
+                sourceObjects: []
+              });
+            }
           }
         }
       } catch (viewErr) {
@@ -1716,17 +1760,19 @@ export class DatabaseManager {
 
       // 3. Get Procedures
       try {
-        const procsRes = await this.mssqlPool.request().query(`
+        const procsRes = await this.executeQuery(`
           SELECT SCHEMA_NAME(schema_id) AS proc_schema, name, OBJECT_DEFINITION(object_id) AS definition 
           FROM sys.procedures
         `);
-        for (const pRow of procsRes.recordset) {
-          schema.procedures.push({
-            name: pRow.name,
-            schema: pRow.proc_schema,
-            definition: pRow.definition || '',
-            parameters: []
-          });
+        if (procsRes.success && procsRes.data) {
+          for (const pRow of procsRes.data) {
+            schema.procedures.push({
+              name: pRow.name || pRow.NAME,
+              schema: pRow.proc_schema || pRow.PROC_SCHEMA || 'dbo',
+              definition: pRow.definition || pRow.DEFINITION || '',
+              parameters: []
+            });
+          }
         }
       } catch (procErr) {
         console.error('Failed to query procedures:', procErr);
@@ -1747,8 +1793,10 @@ export class DatabaseManager {
     if (this.currentDbType === 'mysql' && this.mysqlConnection) {
       return this.getMysqlSchema();
     }
-    if ((this.currentDbType === 'sqlserver' || this.currentDbType === 'mssql') && this.mssqlPool) {
-      return this.getMssqlSchema();
+    if (this.currentDbType === 'sqlserver' || this.currentDbType === 'mssql') {
+      if (this.connectionDetails && !this.connectionDetails.isSimulated) {
+        return this.getMssqlSchema();
+      }
     }
 
     return new Promise((resolve) => {
