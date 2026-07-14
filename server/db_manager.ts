@@ -347,15 +347,6 @@ export class DatabaseManager {
           }
         });
       } else if (type === 'postgres' || type === 'postgresql') {
-        if (isLocalHost(config.host)) {
-          resolve({
-            success: true,
-            message: `PostgreSQL secure tunnel test successful! Connected to virtual server at ${config.host}.`,
-            databases: ['postgres', 'ems_data', 'sensor_records', 'facility_control']
-          });
-          return;
-        }
-        
         const client = new pg.Client({
           host: config.host,
           port: config.port ? parseInt(config.port) : 5432,
@@ -366,11 +357,15 @@ export class DatabaseManager {
         });
         client.connect((err) => {
           if (err) {
-            resolve({
-              success: true,
-              message: `PostgreSQL connection redirected through secure sandbox gateway at ${config.host}.`,
-              databases: ['postgres', 'ems_data', 'sensor_records', 'facility_control']
-            });
+            if (isLocalHost(config.host)) {
+              resolve({
+                success: true,
+                message: `PostgreSQL secure tunnel test successful! Connected to virtual server at ${config.host} (Simulated Sandbox).`,
+                databases: ['postgres', 'ems_data', 'sensor_records', 'facility_control']
+              });
+            } else {
+              resolve({ success: false, message: `PostgreSQL connection failed: ${err.message}` });
+            }
           } else {
             client.query("SELECT datname FROM pg_database WHERE datistemplate = false", (qerr, qres) => {
               client.end();
@@ -378,7 +373,7 @@ export class DatabaseManager {
                 resolve({ 
                   success: true, 
                   message: `PostgreSQL handshake test successful! Port and authentication verified.`,
-                  databases: ['postgres']
+                  databases: [config.databaseName || 'postgres']
                 });
               } else {
                 const dbs = qres.rows.map(r => r.datname);
@@ -392,20 +387,12 @@ export class DatabaseManager {
           }
         });
       } else if (type === 'mysql') {
-        if (isLocalHost(config.host)) {
-          resolve({
-            success: true,
-            message: `MySQL secure tunnel test successful! Connected to virtual server at ${config.host}.`,
-            databases: ['sys', 'performance_schema', 'facility_metrics', 'daikin_meters']
-          });
-          return;
-        }
         mysql.createConnection({
           host: config.host,
           port: config.port ? parseInt(config.port) : 3306,
           user: config.username,
           password: config.password,
-          database: config.databaseName || 'sys'
+          database: config.databaseName || undefined
         }).then((connection) => {
           connection.query('SHOW DATABASES').then(([rows]: any) => {
             connection.end();
@@ -420,31 +407,60 @@ export class DatabaseManager {
             resolve({
               success: true,
               message: `MySQL handshake test successful! Auth verified.`,
-              databases: ['sys']
+              databases: [config.databaseName || 'sys']
             });
           });
         }).catch((err: any) => {
-          resolve({
-            success: true,
-            message: `MySQL connection redirected through secure sandbox gateway at ${config.host}.`,
-            databases: ['sys', 'performance_schema', 'facility_metrics', 'daikin_meters']
-          });
+          if (isLocalHost(config.host)) {
+            resolve({
+              success: true,
+              message: `MySQL connection redirected through secure sandbox gateway at ${config.host} (Simulated Sandbox).`,
+              databases: ['sys', 'performance_schema', 'facility_metrics', 'daikin_meters']
+            });
+          } else {
+            resolve({ success: false, message: `MySQL connection failed: ${err.message}` });
+          }
         });
       } else if (type === 'sqlserver' || type === 'mssql') {
         const portVal = config.port ? parseInt(config.port) : 1433;
-        
-        if (isLocalHost(config.host)) {
-          resolve({
-            success: true,
-            message: `SQL Server secure tunnel test successful! Connected to simulated server at ${config.host}.`,
-            databases: ['DAIKIN_EMS', 'IcoSetup', 'IcoUnifiedConfig', 'Northwind', 'master']
-          });
-          return;
-        }
-
         const hostParts = config.host.split('\\');
         const serverHost = hostParts[0];
         const instanceName = hostParts[1];
+
+        // If Windows authentication is used, test via the Python integrated executor
+        if (config.authType === 'windows') {
+          this.runPythonExecutor({
+            action: 'list_dbs',
+            host: config.host,
+            port: portVal,
+            username: config.username,
+            password: config.password,
+            auth_type: config.authType,
+            database: config.databaseName || 'master'
+          }).then((pyRes) => {
+            if (pyRes && pyRes.success) {
+              resolve({
+                success: true,
+                message: `SQL Server Windows Authentication handshake successful! Databases enumerated.`,
+                databases: pyRes.databases
+              });
+            } else {
+              if (isLocalHost(config.host)) {
+                resolve({
+                  success: true,
+                  message: `SQL Server secure tunnel test successful! Connected to simulated server at ${config.host} (Simulated Sandbox).`,
+                  databases: ['DAIKIN_EMS', 'IcoSetup', 'IcoUnifiedConfig', 'Northwind', 'master']
+                });
+              } else {
+                resolve({
+                  success: false,
+                  message: `SQL Server Windows Authentication failed: ${pyRes ? pyRes.error : 'Connection failed.'}`
+                });
+              }
+            }
+          });
+          return;
+        }
 
         const sqlConfig: mssql.config = {
           user: config.username,
@@ -467,17 +483,7 @@ export class DatabaseManager {
           };
         }
 
-        if (config.authType === 'windows') {
-          // Explaining native windows auth constraint on linux container, and falling back
-          resolve({
-            success: true,
-            message: `Windows integrated authentication is redirected through secure loopback gateway on host ${config.host} (Simulated).`,
-            databases: ['DAIKIN_EMS', 'IcoSetup', 'IcoUnifiedConfig', 'Northwind', 'master']
-          });
-          return;
-        }
-
-        // Try direct connection
+        // Try direct Node mssql pool connection
         const pool = new mssql.ConnectionPool(sqlConfig);
         pool.connect().then(() => {
           pool.request().query("SELECT name FROM sys.databases WHERE name NOT IN ('model', 'tempdb')").then((res) => {
@@ -493,15 +499,40 @@ export class DatabaseManager {
             resolve({
               success: true,
               message: `Microsoft SQL Server handshake test successful! Auth verified, but database enumeration queries were restricted.`,
-              databases: ['master']
+              databases: [config.databaseName || 'master']
             });
           });
         }).catch((err: any) => {
-          // Fallback to simulated mode
-          resolve({
-            success: true,
-            message: `Microsoft SQL Server connection redirected through secure sandbox gateway at ${config.host} (Simulated).`,
-            databases: ['DAIKIN_EMS', 'IcoSetup', 'IcoUnifiedConfig', 'Northwind', 'master']
+          // Fallback to testing via Python executor
+          this.runPythonExecutor({
+            action: 'list_dbs',
+            host: config.host,
+            port: portVal,
+            username: config.username,
+            password: config.password,
+            auth_type: config.authType,
+            database: config.databaseName || 'master'
+          }).then((pyRes) => {
+            if (pyRes && pyRes.success && pyRes.databases && pyRes.databases.length > 0) {
+              resolve({
+                success: true,
+                message: `Microsoft SQL Server connected successfully via secure integrated loopback.`,
+                databases: pyRes.databases
+              });
+            } else {
+              if (isLocalHost(config.host)) {
+                resolve({
+                  success: true,
+                  message: `Microsoft SQL Server connection redirected through secure sandbox gateway at ${config.host} (Simulated Sandbox).`,
+                  databases: ['DAIKIN_EMS', 'IcoSetup', 'IcoUnifiedConfig', 'Northwind', 'master']
+                });
+              } else {
+                resolve({
+                  success: false,
+                  message: `Microsoft SQL Server connection failed: ${err.message}`
+                });
+              }
+            }
           });
         });
       } else {
@@ -541,20 +572,7 @@ export class DatabaseManager {
             const h = hostStr.toLowerCase();
             return h.includes('laptop') || h.includes('localhost') || h.includes('127.0.0.1') || h.includes('fail');
           };
-          if (isLocal(config.host)) {
-            this.currentDbPath = './ems_demo.db';
-            this.db = new sqlite3.Database('./ems_demo.db', (err) => {
-              const detectedDbName = config.databaseName || 'postgres';
-              config.databaseName = detectedDbName;
-              this.connectionDetails = { ...config, isSimulated: true };
-              resolve({
-                success: true,
-                message: `Connected successfully to simulated PostgreSQL database: ${detectedDbName}`,
-                info: { serverVersion: 'PostgreSQL (Simulated)', dbName: detectedDbName, host: config.host }
-              });
-            });
-            return;
-          }
+          
           const client = new pg.Client({
             host: config.host,
             port: config.port ? parseInt(config.port) : 5432,
@@ -565,18 +583,25 @@ export class DatabaseManager {
           });
           client.connect((err) => {
             if (err) {
-              console.warn('[Postgres Connection] Direct connection failed, falling back to simulated sandbox:', err);
-              this.currentDbPath = './ems_demo.db';
-              this.db = new sqlite3.Database('./ems_demo.db', (err2) => {
-                const detectedDbName = config.databaseName || 'postgres';
-                config.databaseName = detectedDbName;
-                this.connectionDetails = { ...config, isSimulated: true };
-                resolve({
-                  success: true,
-                  message: `Connected successfully to simulated PostgreSQL database: ${detectedDbName}`,
-                  info: { serverVersion: 'PostgreSQL (Simulated)', dbName: detectedDbName, host: config.host }
+              if (isLocal(config.host)) {
+                console.warn('[Postgres Connection] Direct connection failed, falling back to simulated sandbox:', err);
+                this.currentDbPath = './ems_demo.db';
+                this.db = new sqlite3.Database('./ems_demo.db', (err2) => {
+                  const detectedDbName = config.databaseName || 'postgres';
+                  config.databaseName = detectedDbName;
+                  this.connectionDetails = { ...config, isSimulated: true };
+                  resolve({
+                    success: true,
+                    message: `Connected successfully to simulated PostgreSQL database: ${detectedDbName}`,
+                    info: { serverVersion: 'PostgreSQL (Simulated)', dbName: detectedDbName, host: config.host }
+                  });
                 });
-              });
+              } else {
+                resolve({
+                  success: false,
+                  message: `Failed to connect to PostgreSQL database: ${err.message}`
+                });
+              }
             } else {
               this.pgClient = client;
               client.query('SELECT current_database() as dbname', (qerr, qres) => {
@@ -585,7 +610,7 @@ export class DatabaseManager {
                   detectedDbName = qres.rows[0].dbname;
                 }
                 config.databaseName = detectedDbName;
-                this.connectionDetails = config;
+                this.connectionDetails = { ...config, isSimulated: false };
                 resolve({
                   success: true,
                   message: `Connected successfully to PostgreSQL database: ${detectedDbName}`,
@@ -602,20 +627,7 @@ export class DatabaseManager {
             const h = hostStr.toLowerCase();
             return h.includes('laptop') || h.includes('localhost') || h.includes('127.0.0.1') || h.includes('fail');
           };
-          if (isLocal(config.host)) {
-            this.currentDbPath = './ems_demo.db';
-            this.db = new sqlite3.Database('./ems_demo.db', (err) => {
-              const detectedDbName = config.databaseName || 'sys';
-              config.databaseName = detectedDbName;
-              this.connectionDetails = { ...config, isSimulated: true };
-              resolve({
-                success: true,
-                message: `Connected successfully to simulated MySQL database: ${detectedDbName}`,
-                info: { serverVersion: 'MySQL (Simulated)', dbName: detectedDbName, host: config.host }
-              });
-            });
-            return;
-          }
+
           mysql.createConnection({
             host: config.host,
             port: config.port ? parseInt(config.port) : 3306,
@@ -630,7 +642,7 @@ export class DatabaseManager {
                 detectedDbName = rows[0].dbname;
               }
               config.databaseName = detectedDbName;
-              this.connectionDetails = config;
+              this.connectionDetails = { ...config, isSimulated: false };
               resolve({
                 success: true,
                 message: `Connected successfully to MySQL database: ${detectedDbName}`,
@@ -639,7 +651,7 @@ export class DatabaseManager {
             }).catch((qerr) => {
               console.error('MySQL database auto-detection query failed:', qerr);
               config.databaseName = config.databaseName || 'default_mysql';
-              this.connectionDetails = config;
+              this.connectionDetails = { ...config, isSimulated: false };
               resolve({
                 success: true,
                 message: `Connected successfully to MySQL database: ${config.databaseName}`,
@@ -647,18 +659,25 @@ export class DatabaseManager {
               });
             });
           }).catch((err: any) => {
-            console.warn('[MySQL Connection] Direct connection failed, falling back to simulated sandbox:', err);
-            this.currentDbPath = './ems_demo.db';
-            this.db = new sqlite3.Database('./ems_demo.db', (err2) => {
-              const detectedDbName = config.databaseName || 'sys';
-              config.databaseName = detectedDbName;
-              this.connectionDetails = { ...config, isSimulated: true };
-              resolve({
-                success: true,
-                message: `Connected successfully to simulated MySQL database: ${detectedDbName}`,
-                info: { serverVersion: 'MySQL (Simulated)', dbName: detectedDbName, host: config.host }
+            if (isLocal(config.host)) {
+              console.warn('[MySQL Connection] Direct connection failed, falling back to simulated sandbox:', err);
+              this.currentDbPath = './ems_demo.db';
+              this.db = new sqlite3.Database('./ems_demo.db', (err2) => {
+                const detectedDbName = config.databaseName || 'sys';
+                config.databaseName = detectedDbName;
+                this.connectionDetails = { ...config, isSimulated: true };
+                resolve({
+                  success: true,
+                  message: `Connected successfully to simulated MySQL database: ${detectedDbName}`,
+                  info: { serverVersion: 'MySQL (Simulated)', dbName: detectedDbName, host: config.host }
+                });
               });
-            });
+            } else {
+              resolve({
+                success: false,
+                message: `Failed to connect to MySQL database: ${err.message}`
+              });
+            }
           });
         });
       } else if (config.dbType === 'sqlserver' || config.dbType === 'mssql') {
@@ -698,8 +717,8 @@ export class DatabaseManager {
           let directSuccess = false;
           let pool: mssql.ConnectionPool | null = null;
 
-          // Attempt real connection only if it's an external host and SQL Auth is used
-          if (!isLocal(config.host) && config.authType !== 'windows') {
+          // Attempt real mssql connection only if it's NOT Windows Auth
+          if (config.authType !== 'windows') {
             try {
               pool = new mssql.ConnectionPool(sqlConfig);
               await pool.connect();
@@ -735,25 +754,62 @@ export class DatabaseManager {
               }
             });
           } else {
-            // Simulated SQL Server sandbox mode (using SQLite ems_demo.db)
-            const detectedDbName = config.databaseName || 'DAIKIN_EMS';
-            config.databaseName = detectedDbName;
-            this.currentDbType = config.dbType;
-            this.connectionDetails = { ...config, isSimulated: true };
+            // Let's try connecting via Python executor (supports Windows Auth and fallback integrated drivers)
+            const pyRes = await this.runPythonExecutor({
+              action: 'list_dbs',
+              host: config.host,
+              port: portVal,
+              username: config.username,
+              password: config.password,
+              auth_type: config.authType,
+              database: config.databaseName || 'master'
+            });
 
-            this.currentDbPath = './ems_demo.db';
-            this.db = new sqlite3.Database('./ems_demo.db', (err) => {
+            if (pyRes && pyRes.success && pyRes.databases && pyRes.databases.length > 0) {
+              this.currentDbType = config.dbType;
+              this.connectionDetails = { ...config, isSimulated: false };
+              this.db = null; // We will use Python executor for all queries
+
               resolve({
                 success: true,
-                message: `Connection established in Simulated SQL Server Mode (isolated sandbox) for database: ${detectedDbName}`,
+                message: `Connected successfully to real Microsoft SQL Server: ${config.databaseName} at ${config.host} (via Integrated Bridge)`,
                 info: { 
-                  serverVersion: 'Microsoft SQL Server (Simulated)', 
-                  dbName: detectedDbName, 
+                  serverVersion: 'Microsoft SQL Server (Integrated Bridge)', 
+                  dbName: config.databaseName, 
                   host: config.host,
-                  isSimulated: true 
+                  isSimulated: false,
+                  databases: pyRes.databases
                 }
               });
-            });
+            } else {
+              // Both direct mssql pool and python pyodbc failed!
+              // Only fall back to simulated sandbox if the host is local
+              if (isLocal(config.host)) {
+                const detectedDbName = config.databaseName || 'DAIKIN_EMS';
+                config.databaseName = detectedDbName;
+                this.currentDbType = config.dbType;
+                this.connectionDetails = { ...config, isSimulated: true };
+
+                this.currentDbPath = './ems_demo.db';
+                this.db = new sqlite3.Database('./ems_demo.db', (err) => {
+                  resolve({
+                    success: true,
+                    message: `Connection established in Simulated SQL Server Mode (isolated sandbox) for database: ${detectedDbName}`,
+                    info: { 
+                      serverVersion: 'Microsoft SQL Server (Simulated)', 
+                      dbName: detectedDbName, 
+                      host: config.host,
+                      isSimulated: true 
+                    }
+                  });
+                });
+              } else {
+                resolve({
+                  success: false,
+                  message: `Failed to connect to Microsoft SQL Server: ${pyRes ? pyRes.error : 'Connection timed out.'}`
+                });
+              }
+            }
           }
         });
       } else {

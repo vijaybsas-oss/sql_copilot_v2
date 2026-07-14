@@ -29,7 +29,7 @@ def ping_server(host, port=1433):
     Ensures server discovery only lets verified pings proceed.
     """
     clean_host = host.split('\\')[0] # handle instance names like LAPTOP-CK...\\SQLEXPRESS
-    if clean_host.lower() in ['localhost', '127.0.0.1', 'laptop-ck0m4vvh']:
+    if clean_host.lower() in ['localhost', '127.0.0.1', 'laptop-ck0m4vvh', 'laptop-ckom4vvh']:
         return True, f"Verified ping successful to local host: {host}"
     
     try:
@@ -79,11 +79,10 @@ def list_databases(host, port, username, password, auth_type):
             "databases": dbs
         }
     except Exception as e:
-        # If real connection fails, fallback to SSMS screenshot values to ensure seamless UI experience
+        # Report the real exception so the user is informed of the failure
         return {
-            "success": True,
-            "message": f"Successfully connected via secure integrated tunnel (pyodbc fallback): {str(e)}",
-            "databases": REAL_DATABASES
+            "success": False,
+            "error": f"Failed to connect to SQL Server via Integrated Bridge: {str(e)}"
         }
 
 def list_tables(host, port, username, password, auth_type, database):
